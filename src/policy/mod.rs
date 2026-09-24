@@ -96,6 +96,11 @@ impl Policy {
         &self.source
     }
 
+    /// Number of rules, and their names.
+    pub fn rules(&self) -> Vec<String> {
+        self.set.policies().map(|p| self.names.get(&p.id().to_string()).cloned().unwrap_or_else(|| p.id().to_string())).collect()
+    }
+
     fn is_read_only(&self, command: &str) -> bool {
         let words: Vec<String> = shell_words::split(command).unwrap_or_default();
         if words.is_empty() {

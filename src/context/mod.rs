@@ -53,6 +53,8 @@ pub struct Context {
     pub hidden: usize,
     pub dropped: usize,
     pub cache: Option<CacheDecision>,
+    /// Older chunks whose visibility came from the memo instead of Jev.
+    pub memo_hits: usize,
     /// Summary chunks generated during assembly; the caller appends them.
     pub new_chunks: Vec<Chunk>,
 }
@@ -85,6 +87,8 @@ pub struct AssembleInput<'a> {
     pub pinned: Vec<Chunk>,
     /// The order sent last turn, for the cache-reuse decision.
     pub previous_order: Option<&'a [ChunkId]>,
+    /// Ignore memoised scores for older chunks this turn (after a "rebuild").
+    pub rescore_all: bool,
     /// Price per million tokens: (uncached input, cached input).
     pub prices: (f64, f64),
 }
@@ -92,11 +96,23 @@ pub struct AssembleInput<'a> {
 pub struct Assembler {
     cfg: BudgetConfig,
     summarizer: Arc<dyn Summarizer>,
+    /// Visibility of an older chunk, keyed on (chunk, goal). Recent chunks are
+    /// re-scored every turn; older ones only when the goal changes or the
+    /// cache decision said "rebuild".
+    memo: moka::sync::Cache<(ChunkId, u64), (Visibility, f64)>,
+}
+
+fn hash64(s: &str) -> u64 {
+    u64::from_le_bytes(blake3::hash(s.as_bytes()).as_bytes()[..8].try_into().unwrap())
 }
 
 impl Assembler {
     pub fn new(cfg: BudgetConfig, summarizer: Arc<dyn Summarizer>) -> Self {
-        Self { cfg, summarizer }
+        Self { cfg, summarizer, memo: moka::sync::Cache::new(200_000) }
+    }
+
+    pub fn memo_len(&self) -> u64 {
+        self.memo.entry_count()
     }
 
     pub fn budget(&self) -> u32 {
@@ -142,12 +158,28 @@ impl Assembler {
         recent
     }
 
-    /// Batch visibility questions so each request's state stays under the Jev state limit.
-    async fn score(&self, jev: &Jev, input: &AssembleInput<'_>, cands: &[(usize, &Chunk)]) -> Result<HashMap<ChunkId, (Visibility, f64)>> {
+    /// Batch visibility questions so each request's state stays under the Jev
+    /// state limit. Older chunks already scored for this goal come from the memo.
+    async fn score(&self, jev: &Jev, input: &AssembleInput<'_>, cands: &[(usize, &Chunk)], recent_from: u32) -> Result<(HashMap<ChunkId, (Visibility, f64)>, usize)> {
+        let goal_key = hash64(input.goal);
+        let mut out = HashMap::new();
+        let mut hits = 0usize;
+        let mut to_score: Vec<&Chunk> = Vec::new();
+        for (_, c) in cands {
+            let older = c.session != input.session || c.turn < recent_from;
+            if older && !input.rescore_all {
+                if let Some(v) = self.memo.get(&(c.id, goal_key)) {
+                    out.insert(c.id, v);
+                    hits += 1;
+                    continue;
+                }
+            }
+            to_score.push(c);
+        }
         let mut batches: Vec<Vec<&Chunk>> = vec![Vec::new()];
         let mut acc: u32 = 0;
         let per = |c: &Chunk| tokens::count(&c.preview(self.cfg.preview_chars)) + 40;
-        for (_, c) in cands {
+        for c in &to_score {
             let t = per(c);
             if acc + t > self.cfg.jev_state_tokens && !batches.last().unwrap().is_empty() {
                 batches.push(Vec::new());
@@ -175,17 +207,18 @@ impl Assembler {
             async move { jev.ask(state, qs).await }
         });
         let responses = futures::future::try_join_all(futs).await?;
-        let mut out = HashMap::new();
         for r in responses {
             for (id, a) in &r.answers {
                 if let Some(hex) = id.strip_prefix(questions::VIS_PREFIX) {
                     if let Some(cid) = ChunkId::parse(hex) {
-                        out.insert(cid, questions::visibility_from(a));
+                        let v = questions::visibility_from(a);
+                        self.memo.insert((cid, goal_key), v);
+                        out.insert(cid, v);
                     }
                 }
             }
         }
-        Ok(out)
+        Ok((out, hits))
     }
 
     async fn render(&self, snap: &Snapshot, c: &Chunk, level: Visibility, new_chunks: &mut Vec<Chunk>) -> Result<String> {
@@ -209,7 +242,8 @@ impl Assembler {
     pub async fn build(&self, input: AssembleInput<'_>, jev: &Jev) -> Result<Context> {
         let snap = input.snap;
         let cands = self.candidates(snap, input.query, input.session, input.turn);
-        let scores = self.score(jev, &input, &cands).await?;
+        let recent_from = input.turn.saturating_sub(self.cfg.recent_turns);
+        let (scores, memo_hits) = self.score(jev, &input, &cands, recent_from).await?;
         let mut new_chunks = Vec::new();
         let mut items: Vec<ContextItem> = Vec::new();
         let mut hidden = 0usize;
@@ -301,7 +335,7 @@ impl Assembler {
             _ => selected.sort_by(|a, b| (!a.pinned, a.seq).cmp(&(!b.pinned, b.seq))),
         }
 
-        Ok(Context { items: selected, tokens: total, budget, scored: cands.len(), hidden, dropped, cache, new_chunks })
+        Ok(Context { items: selected, tokens: total, budget, scored: cands.len() - memo_hits, hidden, dropped, cache, memo_hits, new_chunks })
     }
 }
 
@@ -323,11 +357,32 @@ mod tests {
         let jev = Jev::new(Arc::new(LocalTransport), "local");
         let asm = Assembler::new(BudgetConfig { context_tokens: 400, ..Default::default() }, Arc::new(TruncateSummarizer));
         let ctx = asm
-            .build(AssembleInput { snap: &snap, goal: "fix login", query: "fix the login bug in auth session", session: "s", turn: 2, pinned: vec![], previous_order: None, prices: (5.0, 0.5) }, &jev)
+            .build(AssembleInput { snap: &snap, goal: "fix login", query: "fix the login bug in auth session", session: "s", turn: 2, pinned: vec![], previous_order: None, rescore_all: false, prices: (5.0, 0.5) }, &jev)
             .await
             .unwrap();
         assert!(ctx.tokens <= 400);
         assert!(ctx.items.iter().any(|i| i.kind == "user"));
         assert!(!ctx.items.iter().any(|i| i.text.contains("pancakes") && i.visibility == Visibility::Full));
+    }
+
+    #[tokio::test]
+    async fn older_chunks_hit_the_memo_on_the_next_turn() {
+        let mut store = ChunkStore::ephemeral();
+        for i in 0..6 {
+            store.append(Chunk::new(Kind::UserTurn, format!("earlier note {i} about login sessions"), 1, "s")).unwrap();
+        }
+        let snap = store.snapshot();
+        let jev = Jev::new(Arc::new(LocalTransport), "local");
+        let asm = Assembler::new(BudgetConfig { recent_turns: 1, ..Default::default() }, Arc::new(TruncateSummarizer));
+        let input = |turn| AssembleInput { snap: &snap, goal: "fix login", query: "fix login", session: "s", turn, pinned: vec![], previous_order: None, rescore_all: false, prices: (5.0, 0.5) };
+        let first = asm.build(input(10), &jev).await.unwrap();
+        assert_eq!(first.memo_hits, 0);
+        let second = asm.build(input(11), &jev).await.unwrap();
+        assert_eq!(second.memo_hits, 6);
+        assert_eq!(second.scored, 0);
+        let mut forced = input(12);
+        forced.rescore_all = true;
+        let third = asm.build(forced, &jev).await.unwrap();
+        assert_eq!(third.memo_hits, 0);
     }
 }

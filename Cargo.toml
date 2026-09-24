@@ -34,7 +34,7 @@ blake3 = "1"
 hex = "0.4"
 redb = "2"
 im = "15"
-moka = { version = "0.12", features = ["future"] }
+moka = { version = "0.12", features = ["future", "sync"] }
 schemars = "1"
 jsonschema = { version = "0.57", default-features = false }
 cedar-policy = "4"

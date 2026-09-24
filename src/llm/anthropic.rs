@@ -22,6 +22,7 @@ pub struct AnthropicClient {
     http: reqwest::Client,
     base: String,
     auth: Auth,
+    source: &'static str,
     fallbacks: bool,
 }
 
@@ -31,10 +32,10 @@ impl AnthropicClient {
     pub fn from_env(fallbacks: bool) -> Result<Self> {
         let base = std::env::var("ANTHROPIC_BASE_URL").unwrap_or_else(|_| "https://api.anthropic.com".into());
         let api_key = std::env::var("ANTHROPIC_API_KEY").ok().map(|k| k.trim().to_string()).filter(|k| !k.is_empty());
-        let auth = if let Some(k) = api_key {
-            Auth::ApiKey(k)
+        let (auth, source) = if let Some(k) = api_key {
+            (Auth::ApiKey(k), "ANTHROPIC_API_KEY")
         } else if let Some(t) = std::env::var("ANTHROPIC_AUTH_TOKEN").ok().map(|t| t.trim().to_string()).filter(|t| !t.is_empty()) {
-            Auth::Bearer(t)
+            (Auth::Bearer(t), "ANTHROPIC_AUTH_TOKEN")
         } else {
             let out = std::process::Command::new("ant").args(["auth", "print-credentials", "--access-token"]).output();
             match out {
@@ -43,13 +44,22 @@ impl AnthropicClient {
                     if t.is_empty() {
                         return Err(anyhow!("no Anthropic credentials: set ANTHROPIC_API_KEY or run `ant auth login`"));
                     }
-                    Auth::Bearer(t)
+                    (Auth::Bearer(t), "ant auth profile")
                 }
                 _ => return Err(anyhow!("no Anthropic credentials: set ANTHROPIC_API_KEY or run `ant auth login`")),
             }
         };
         let http = reqwest::Client::builder().timeout(Duration::from_secs(600)).build()?;
-        Ok(Self { http, base: base.trim_end_matches('/').to_string(), auth, fallbacks })
+        Ok(Self { http, base: base.trim_end_matches('/').to_string(), auth, source, fallbacks })
+    }
+
+    /// Where the credential came from.
+    pub fn auth_source(&self) -> &'static str {
+        self.source
+    }
+
+    pub fn base_url(&self) -> &str {
+        &self.base
     }
 
     fn supports_effort(model: &str) -> bool {

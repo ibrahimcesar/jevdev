@@ -116,6 +116,8 @@ pub struct Session {
     tools: ToolRegistry,
     goal: String,
     last_order: Option<Vec<ChunkId>>,
+    /// The last cache decision was "rebuild": re-score every chunk this turn.
+    last_rebuilt: bool,
     recent_paths: Vec<PathBuf>,
     model_override: Option<String>,
     max_turns: u32,
@@ -182,6 +184,7 @@ impl Session {
             tools: ToolRegistry::builtin(),
             goal: String::new(),
             last_order: None,
+            last_rebuilt: false,
             recent_paths: Vec::new(),
             model_override: None,
             max_turns,
@@ -201,6 +204,7 @@ impl Session {
             tools: ToolRegistry::builtin().read_only(),
             goal: String::new(),
             last_order: None,
+            last_rebuilt: false,
             recent_paths: Vec::new(),
             model_override: Some(worker),
             max_turns,
@@ -278,13 +282,14 @@ impl Session {
         let ctx = s
             .assembler
             .build(
-                AssembleInput { snap: &snap, goal: &self.goal, query, session: &self.id, turn: self.turn, pinned, previous_order: self.last_order.as_deref(), prices: (frontier.input, frontier.cached) },
+                AssembleInput { snap: &snap, goal: &self.goal, query, session: &self.id, turn: self.turn, pinned, previous_order: self.last_order.as_deref(), rescore_all: self.last_rebuilt, prices: (frontier.input, frontier.cached) },
                 &s.jev,
             )
             .await?;
         for c in &ctx.new_chunks {
             self.append(c.clone()).await?;
         }
+        self.last_rebuilt = ctx.cache.as_ref().map(|c| !c.reuse).unwrap_or(false);
         if let Some(cd) = &ctx.cache {
             emit(
                 self.events(),
@@ -302,6 +307,7 @@ impl Session {
                 tokens: ctx.tokens,
                 budget: ctx.budget,
                 scored: ctx.scored,
+                memo_hits: ctx.memo_hits,
                 hidden: ctx.hidden,
                 dropped: ctx.dropped,
                 reused: ctx.cache.as_ref().map(|c| c.reuse),

@@ -31,7 +31,7 @@ pub enum Event {
     TurnStart { session: String, turn: u32, query: String },
     /// A Jev decision at one of the six points.
     Decision { point: &'static str, detail: String, p: f64 },
-    Context { rows: Vec<ContextRow>, tokens: u32, budget: u32, scored: usize, hidden: usize, dropped: usize, reused: Option<bool> },
+    Context { rows: Vec<ContextRow>, tokens: u32, budget: u32, scored: usize, memo_hits: usize, hidden: usize, dropped: usize, reused: Option<bool> },
     Route { model: String, est: f64, p: f64, reason: String, alternatives: Vec<(String, f64)> },
     /// Prose the model wrote before an action.
     Note { model: String, text: String },
@@ -58,8 +58,8 @@ pub fn print_plain(e: &Event) {
         Event::Info(s) => println!("· {s}"),
         Event::TurnStart { session, turn, query } => println!("\n── turn {turn} · session {session} ──\n  {}", crate::state::truncate(query, 120)),
         Event::Decision { point, detail, p } => println!("  jev {point:<12} {detail}  (p={p:.2})"),
-        Event::Context { rows, tokens, budget, scored, hidden, dropped, reused } => {
-            println!("  context {tokens}/{budget} tok · {scored} scored · {hidden} hidden · {dropped} dropped{}", match reused { Some(true) => " · prefix reused", Some(false) => " · rebuilt", None => "" });
+        Event::Context { rows, tokens, budget, scored, memo_hits, hidden, dropped, reused } => {
+            println!("  context {tokens}/{budget} tok · {scored} scored by jev · {memo_hits} from memo · {hidden} hidden · {dropped} dropped{}", match reused { Some(true) => " · prefix reused", Some(false) => " · rebuilt", None => "" });
             for r in rows {
                 println!("    {:<5} {:>6} tok  p={:.2}  {}{}", r.visibility, r.tokens, r.p, if r.pinned { "📌 " } else { "" }, r.label);
             }

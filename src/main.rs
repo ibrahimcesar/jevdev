@@ -35,6 +35,7 @@ enum Command {
     },
     /// Run one goal with plain output.
     Run {
+        /// What to accomplish, in plain words.
         goal: String,
         /// Answer every permission prompt with yes.
         #[arg(long)]
@@ -74,6 +75,12 @@ enum Command {
     },
     /// Configured models, prices, and trust tiers.
     Models,
+    /// Check keys, endpoints, policy, instructions, and the store.
+    Doctor {
+        /// Skip the network round trips.
+        #[arg(long)]
+        offline: bool,
+    },
 }
 
 #[tokio::main]
@@ -97,6 +104,7 @@ async fn main() -> Result<()> {
             Ok(())
         }
         Command::State { show, session, limit } => state(cfg, &root, show, session, limit).await,
+        Command::Doctor { offline } => doctor(cfg, &root, offline).await,
         Command::Models => {
             println!("{:<22} {:<10} {:<9} {:>7} {:>7} {:>7}  description", "model", "tier", "trust", "in", "cached", "out");
             for m in &cfg.models {
@@ -106,6 +114,135 @@ async fn main() -> Result<()> {
             Ok(())
         }
     }
+}
+
+async fn doctor(cfg: Config, root: &std::path::Path, offline: bool) -> Result<()> {
+    use jevdev::jev::{Jev, Question};
+    use std::time::Instant;
+    let mut failures = 0u32;
+    let ok = |name: &str, detail: String| println!("  ✓ {name:<13} {detail}");
+    let warn = |name: &str, detail: String| println!("  ! {name:<13} {detail}");
+    println!("jevdev {} · {}\n", jevdev::VERSION, root.display());
+
+    let cfg_path = root.join(CONFIG_FILE);
+    if cfg_path.exists() {
+        ok("config", format!("{}", cfg_path.display()));
+    } else {
+        warn("config", "no jevdev.toml, using defaults (run `jevdev init`)".into());
+    }
+
+    // Jev
+    match Jev::from_config(&cfg.jev) {
+        Ok(jev) if jev.transport_name() == "local" => warn("jev", "local heuristics stand in for Jev; set TYPESAFE_API_KEY for the real model".into()),
+        Ok(jev) => {
+            if offline {
+                ok("jev", format!("http · {} · {}", cfg.jev.endpoint, cfg.jev.model));
+            } else {
+                let t = Instant::now();
+                match jev.ask_one(serde_json::json!({ "probe": "jevdev doctor health check" }), "probe", Question::noul("Is state.probe a health-check message from a developer tool?")).await {
+                    Ok(a) => {
+                        let s = jev.stats();
+                        ok("jev", format!("{} · {} · {:?} · {} input tok · {}", cfg.jev.endpoint, cfg.jev.model, t.elapsed(), s.input_tokens, a.summary()));
+                    }
+                    Err(e) => {
+                        failures += 1;
+                        println!("  ✗ {:<13} {e:#}", "jev");
+                    }
+                }
+            }
+        }
+        Err(e) => {
+            failures += 1;
+            println!("  ✗ {:<13} {e:#}", "jev");
+        }
+    }
+
+    // Model
+    if cfg.llm.provider == "scripted" {
+        warn("model", "scripted demo client; set llm.provider = \"anthropic\" for a real model".into());
+    } else {
+        match jevdev::llm::anthropic::AnthropicClient::from_env(cfg.llm.fallbacks) {
+            Ok(c) => {
+                if offline {
+                    ok("model", format!("{} · credentials from {}", c.base_url(), c.auth_source()));
+                } else {
+                    use jevdev::llm::LlmClient;
+                    let t = Instant::now();
+                    match c.small(&cfg.llm.cheap, "Reply with exactly: OK", "ping", 8).await {
+                        Ok(text) => ok("model", format!("{} · {} via {} · {:?} · replied {:?}", c.base_url(), cfg.llm.cheap, c.auth_source(), t.elapsed(), text.trim())),
+                        Err(e) => {
+                            failures += 1;
+                            println!("  ✗ {:<13} {} via {}: {e:#}", "model", cfg.llm.cheap, c.auth_source());
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                failures += 1;
+                println!("  ✗ {:<13} {e:#}", "model");
+            }
+        }
+    }
+    let mut models_ok = true;
+    for (role, id) in [("frontier", &cfg.llm.frontier), ("worker", &cfg.llm.worker), ("cheap", &cfg.llm.cheap)] {
+        if cfg.model(id).is_none() {
+            failures += 1;
+            models_ok = false;
+            println!("  ✗ {:<13} llm.{role} = {id} is not in [[models]], so it has no price or trust tier", "models");
+        }
+    }
+    if models_ok {
+        ok("models", format!("{} configured · frontier {} · worker {} · cheap {} · routing {}", cfg.models.len(), cfg.llm.frontier, cfg.llm.worker, cfg.llm.cheap, cfg.llm.routing));
+    }
+
+    // Policy
+    match jevdev::policy::Policy::load(root, &cfg) {
+        Ok(p) => {
+            let rules = p.rules();
+            let src = if root.join(&cfg.policy.file).exists() { cfg.policy.file.clone() } else { "built-in default".into() };
+            ok("policy", format!("{} rules from {src}: {}", rules.len(), rules.join(", ")));
+        }
+        Err(e) => {
+            failures += 1;
+            println!("  ✗ {:<13} {e:#}", "policy");
+        }
+    }
+
+    // Instructions
+    match runtime::Instructions::load(root) {
+        Ok(i) if i.is_empty() => warn("instructions", "no AGENTS.md (run `jevdev init` for a sample)".into()),
+        Ok(i) => {
+            let conds: Vec<String> = i.fragments().iter().map(|f| f.condition.describe()).collect();
+            ok("instructions", format!("{} fragments: {}", i.len(), conds.join(" · ")));
+        }
+        Err(e) => {
+            failures += 1;
+            println!("  ✗ {:<13} {e:#}", "instructions");
+        }
+    }
+
+    // Store (opened only if it exists; doctor leaves no files behind)
+    let path = root.join(&cfg.session.dir).join("state.redb");
+    if path.exists() {
+        match jevdev::state::ChunkStore::open(&path) {
+            Ok(s) => ok("store", format!("{} chunks in {}", s.len(), path.display())),
+            Err(e) => {
+                failures += 1;
+                println!("  ✗ {:<13} {e:#}", "store");
+            }
+        }
+    } else {
+        ok("store", format!("none yet; the first session creates {}", path.display()));
+    }
+    ok("tools", format!("{} built in", ToolRegistry::builtin().len()));
+
+    println!();
+    if failures > 0 {
+        println!("{failures} problem(s)");
+        std::process::exit(1);
+    }
+    println!("all good");
+    Ok(())
 }
 
 fn init(root: &std::path::Path, force: bool) -> Result<()> {

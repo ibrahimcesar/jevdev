@@ -105,11 +105,11 @@ impl App {
             Event::Decision { point, detail, p } => {
                 self.decision(Line::from(vec![Span::styled(format!("{point:<9}"), Style::default().fg(Color::Magenta)), Span::raw(format!("{} ", crate::state::truncate(&detail, 60))), Span::styled(format!("p={p:.2}"), Style::default().dim())]));
             }
-            Event::Context { rows, tokens, budget, scored, hidden, dropped, reused } => {
+            Event::Context { rows, tokens, budget, scored, memo_hits, hidden, dropped, reused } => {
                 self.rows = rows;
                 self.ctx_tokens = tokens;
                 self.ctx_budget = budget;
-                self.ctx_note = format!("{scored} scored · {hidden} hidden · {dropped} over budget{}", match reused { Some(true) => " · prefix reused", Some(false) => " · rebuilt", None => "" });
+                self.ctx_note = format!("{scored} jev · {memo_hits} memo · {hidden} hidden · {dropped} over{}", match reused { Some(true) => " · prefix reused", Some(false) => " · rebuilt", None => "" });
             }
             Event::Route { model, est, p, reason, .. } => {
                 self.model = model.clone();

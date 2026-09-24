@@ -9,7 +9,8 @@ Ordered by value. Checked items are shipped on `main`.
 
 ## Next
 
-- [ ] **Integration test + `run --json`.** Turn the offline smoke run into a `cargo test`; emit events as JSON lines for scripting; add a replay mode over a recorded store to compare assembler changes without spending.
+- [x] **Integration test + `run --json` + `replay`.** The offline loop is a `cargo test`; `run --json` emits events as JSON lines; `replay` re-assembles a recorded session turn by turn without a model. `RUST_LOG=jev=debug` prints every System One request.
+- [x] **Questions per TypeSafe's guide.** Backticked state paths, contrastive `what`/`not_for`/`examples` criteria, permissions decomposed into five nouls composed in code.
 - [ ] **Heatmap filtering of big outputs.** Score lines or hunks of a large tool output with a Jev fan-out and show only the relevant ones at the `long` level.
 - [ ] **Parallel sub-agents.** Run several read-only sub-agents concurrently in a `JoinSet`; leases and snapshots already permit it.
 - [ ] **Streaming frontier calls.** SSE parsing so the TUI shows text as it arrives and long turns cannot time out.

@@ -121,7 +121,15 @@ impl ToolRegistry {
         let (qid, q) = questions::tool_pick(&snippets);
         let answer = jev.ask_one(json!({ "intent": intent }), &qid, q).await?;
         let ranked = answer.ranked();
-        let candidates: Vec<(String, f64)> = ranked.iter().take(3).cloned().collect();
+        // Fall through only to candidates Jev gave real weight, and never to a
+        // sub-agent by accident: a mis-routed delegation is the expensive mistake.
+        let candidates: Vec<(String, f64)> = ranked
+            .iter()
+            .enumerate()
+            .filter(|(i, (t, p))| *i == 0 || (*p >= 0.05 && (t != "delegate" || *p >= 0.3)))
+            .map(|(_, c)| c.clone())
+            .take(3)
+            .collect();
         let mut last_err = None;
         for (tool_id, _) in &candidates {
             let Some(tool) = self.get(tool_id) else { continue };

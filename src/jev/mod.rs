@@ -30,8 +30,9 @@ use std::sync::Arc;
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "lowercase")]
 pub enum Question {
-    /// Pick one option. Up to 255 options; descriptions may be null.
-    Choice { instructions: Value, criteria: BTreeMap<String, Option<String>> },
+    /// Pick one option. Up to 255 options. Each description may be null, a
+    /// string, or a contrastive object (`what`, `not_for`, `examples`).
+    Choice { instructions: Value, criteria: BTreeMap<String, Value> },
     /// Rate on an ordered scale of 2 to 10 level descriptions, low to high.
     Score { instructions: Value, criteria: Vec<String> },
     /// Yes or no, returned as the probability of yes.
@@ -45,9 +46,9 @@ pub enum Question {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct NoulCriteria {
     #[serde(rename = "true")]
-    pub yes: String,
+    pub yes: Value,
     #[serde(rename = "false")]
-    pub no: String,
+    pub no: Value,
 }
 
 impl Question {
@@ -55,19 +56,16 @@ impl Question {
     where
         I: IntoIterator<Item = (K, D)>,
         K: Into<String>,
-        D: Into<String>,
+        D: Into<Value>,
     {
-        Self::Choice {
-            instructions: instructions.into(),
-            criteria: options.into_iter().map(|(k, d)| (k.into(), Some(d.into()))).collect(),
-        }
+        Self::Choice { instructions: instructions.into(), criteria: options.into_iter().map(|(k, d)| (k.into(), d.into())).collect() }
     }
     pub fn choice_bare<I, K>(instructions: impl Into<Value>, options: I) -> Self
     where
         I: IntoIterator<Item = K>,
         K: Into<String>,
     {
-        Self::Choice { instructions: instructions.into(), criteria: options.into_iter().map(|k| (k.into(), None)).collect() }
+        Self::Choice { instructions: instructions.into(), criteria: options.into_iter().map(|k| (k.into(), Value::Null)).collect() }
     }
     pub fn score<I, L>(instructions: impl Into<Value>, levels: I) -> Self
     where
@@ -79,7 +77,7 @@ impl Question {
     pub fn noul(instructions: impl Into<Value>) -> Self {
         Self::Noul { instructions: instructions.into(), criteria: None }
     }
-    pub fn noul_with(instructions: impl Into<Value>, yes: &str, no: &str) -> Self {
+    pub fn noul_with(instructions: impl Into<Value>, yes: impl Into<Value>, no: impl Into<Value>) -> Self {
         Self::Noul { instructions: instructions.into(), criteria: Some(NoulCriteria { yes: yes.into(), no: no.into() }) }
     }
     pub fn kind(&self) -> &'static str {
@@ -283,7 +281,10 @@ impl Jev {
             return Ok(hit);
         }
         let n = req.questions.len() as u64;
+        // `RUST_LOG=jev=debug` prints every System One request and response.
+        tracing::debug!(target: "jev", transport = self.transport.name(), request = %serde_json::to_string(&req).unwrap_or_default());
         let resp = Arc::new(self.transport.system_one(&req).await?);
+        tracing::debug!(target: "jev", response = %serde_json::to_string(&*resp).unwrap_or_default());
         self.calls.fetch_add(1, Ordering::Relaxed);
         self.questions.fetch_add(n, Ordering::Relaxed);
         self.tokens.fetch_add(resp.usage.input_tokens, Ordering::Relaxed);

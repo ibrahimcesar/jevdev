@@ -29,6 +29,12 @@ use std::sync::Arc;
 use tokio::sync::{watch, Mutex};
 
 pub use events::{emit, print_plain, ContextRow, Event, EventSink, UsageSnapshot};
+
+impl Session {
+    pub fn set_goal(&mut self, goal: &str) {
+        self.goal = goal.to_string();
+    }
+}
 pub use instructions::Instructions;
 
 /// Who answers when the policy says `ask`.
@@ -109,6 +115,14 @@ pub struct Totals {
     pub turns: u32,
 }
 
+/// Overrides for tests and embedding: inject a model or a Jev client instead of
+/// building them from the config.
+#[derive(Default)]
+pub struct SessionOptions {
+    pub llm: Option<Arc<dyn LlmClient>>,
+    pub jev: Option<Arc<Jev>>,
+}
+
 pub struct Session {
     pub shared: Arc<Shared>,
     pub id: String,
@@ -134,13 +148,21 @@ fn new_session_id() -> String {
 impl Session {
     /// Open the main session for `root`.
     pub async fn open(cfg: Config, root: &Path, events: EventSink, permissioner: Arc<dyn Permissioner>) -> Result<Self> {
+        Self::open_with(cfg, root, events, permissioner, SessionOptions::default()).await
+    }
+
+    pub async fn open_with(cfg: Config, root: &Path, events: EventSink, permissioner: Arc<dyn Permissioner>, opts: SessionOptions) -> Result<Self> {
         let root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
         let state_path = root.join(&cfg.session.dir).join("state.redb");
         let store = ChunkStore::open(&state_path)?;
-        let jev = Arc::new(Jev::from_config(&cfg.jev)?);
-        let llm: Arc<dyn LlmClient> = match cfg.llm.provider.as_str() {
-            "scripted" => Arc::new(llm::scripted::ScriptedClient::from_env()?),
-            _ => match llm::anthropic::AnthropicClient::from_env(cfg.llm.fallbacks) {
+        let jev = match opts.jev {
+            Some(j) => j,
+            None => Arc::new(Jev::from_config(&cfg.jev)?),
+        };
+        let llm: Arc<dyn LlmClient> = match (opts.llm, cfg.llm.provider.as_str()) {
+            (Some(l), _) => l,
+            (None, "scripted") => Arc::new(llm::scripted::ScriptedClient::from_env()?),
+            (None, _) => match llm::anthropic::AnthropicClient::from_env(cfg.llm.fallbacks) {
                 Ok(c) => Arc::new(c),
                 Err(e) => {
                     emit(&events, Event::Info(format!("{e}; falling back to the scripted demo model")));
@@ -273,16 +295,35 @@ impl Session {
         Ok(answer)
     }
 
+    /// Remember paths as recently touched, for conditional instructions and sensitivity.
+    pub fn note_paths(&mut self, paths: impl IntoIterator<Item = PathBuf>) {
+        for p in paths {
+            let abs = if p.is_absolute() { p } else { self.shared.root.join(p) };
+            if !self.recent_paths.contains(&abs) {
+                self.recent_paths.push(abs);
+            }
+        }
+        if self.recent_paths.len() > 24 {
+            let n = self.recent_paths.len() - 24;
+            self.recent_paths.drain(..n);
+        }
+    }
+
     /// Assemble the context for `query` without calling the model.
     pub async fn assemble(&mut self, query: &str) -> Result<crate::context::Context> {
+        let snap = self.snapshot().await;
+        self.assemble_snapshot(&snap, query).await
+    }
+
+    /// Assemble over an explicit snapshot, for replay over earlier store states.
+    pub async fn assemble_snapshot(&mut self, snap: &Snapshot, query: &str) -> Result<crate::context::Context> {
         let s = &self.shared;
         let pinned = s.instructions.active(query, &self.recent_paths, &s.root, &s.jev, &self.id, self.turn).await?;
-        let snap = self.snapshot().await;
         let frontier = s.router.frontier();
         let ctx = s
             .assembler
             .build(
-                AssembleInput { snap: &snap, goal: &self.goal, query, session: &self.id, turn: self.turn, pinned, previous_order: self.last_order.as_deref(), rescore_all: self.last_rebuilt, prices: (frontier.input, frontier.cached) },
+                AssembleInput { snap, goal: &self.goal, query, session: &self.id, turn: self.turn, pinned, previous_order: self.last_order.as_deref(), rescore_all: self.last_rebuilt, prices: (frontier.input, frontier.cached) },
                 &s.jev,
             )
             .await?;
@@ -403,16 +444,7 @@ impl Session {
         self.append(out_chunk).await?;
         emit(self.events(), Event::ToolRan { tool: output.tool.clone(), access: output.access.to_string(), ok: output.ok, tokens: tokens::count(&output.body), preview: crate::state::truncate(&output.body, 300) });
 
-        for p in &output.paths {
-            let abs = if p.is_absolute() { p.clone() } else { s.root.join(p) };
-            if !self.recent_paths.contains(&abs) {
-                self.recent_paths.push(abs);
-            }
-        }
-        if self.recent_paths.len() > 24 {
-            let n = self.recent_paths.len() - 24;
-            self.recent_paths.drain(..n);
-        }
+        self.note_paths(output.paths.iter().cloned());
         if output.access == Access::Write && output.ok {
             let snap = self.snapshot().await;
             let r = background::retrieve(&snap, &self.id, self.turn, &self.goal, output.paths.clone(), intent);

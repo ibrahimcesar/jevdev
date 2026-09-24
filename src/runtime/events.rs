@@ -46,6 +46,36 @@ pub enum Event {
     Ask { call: String, reasons: Vec<String>, reply: oneshot::Sender<bool> },
 }
 
+impl Event {
+    /// A JSON object for `run --json` and logs. The `ask` reply channel is not included.
+    pub fn to_json(&self) -> serde_json::Value {
+        use serde_json::json;
+        match self {
+            Event::Info(s) => json!({ "type": "info", "text": s }),
+            Event::TurnStart { session, turn, query } => json!({ "type": "turn", "session": session, "turn": turn, "query": query }),
+            Event::Decision { point, detail, p } => json!({ "type": "decision", "point": point, "detail": detail, "p": p }),
+            Event::Context { rows, tokens, budget, scored, memo_hits, hidden, dropped, reused } => json!({
+                "type": "context", "tokens": tokens, "budget": budget, "scored": scored, "memo_hits": memo_hits, "hidden": hidden, "dropped": dropped, "reused": reused,
+                "rows": rows.iter().map(|r| json!({ "id": r.id, "label": r.label, "visibility": r.visibility.as_str(), "tokens": r.tokens, "p": r.p, "pinned": r.pinned })).collect::<Vec<_>>(),
+            }),
+            Event::Route { model, est, p, reason, alternatives } => json!({ "type": "route", "model": model, "est": est, "p": p, "reason": reason, "alternatives": alternatives.iter().map(|(m, c)| json!({ "model": m, "est": c })).collect::<Vec<_>>() }),
+            Event::Note { model, text } => json!({ "type": "note", "model": model, "text": text }),
+            Event::ToolPicked { tool, intent, candidates, args } => json!({ "type": "tool_picked", "tool": tool, "intent": intent, "args": args, "candidates": candidates.iter().map(|(t, p)| json!({ "tool": t, "p": p })).collect::<Vec<_>>() }),
+            Event::Permit { verdict, reasons, call } => json!({ "type": "permit", "verdict": verdict, "reasons": reasons, "call": call }),
+            Event::ToolRan { tool, access, ok, tokens, preview } => json!({ "type": "tool_ran", "tool": tool, "access": access, "ok": ok, "tokens": tokens, "preview": preview }),
+            Event::Subagent { id, goal, status } => json!({ "type": "subagent", "id": id, "goal": goal, "status": status }),
+            Event::Done { session, answer } => json!({ "type": "done", "session": session, "answer": answer }),
+            Event::Error(s) => json!({ "type": "error", "text": s }),
+            Event::Usage(u) => json!({
+                "type": "usage", "turns": u.turns,
+                "llm": { "input": u.llm.input, "cached_read": u.llm.cached_read, "cache_write": u.llm.cache_write, "output": u.llm.output, "cost": u.llm_cost },
+                "jev": { "calls": u.jev_calls, "questions": u.jev_questions, "input_tokens": u.jev_tokens, "cost": u.jev_cost, "memo_hits": u.memo_hits },
+            }),
+            Event::Ask { call, reasons, .. } => json!({ "type": "ask", "call": call, "reasons": reasons }),
+        }
+    }
+}
+
 pub type EventSink = mpsc::UnboundedSender<Event>;
 
 pub fn emit(sink: &EventSink, e: Event) {

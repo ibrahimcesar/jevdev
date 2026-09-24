@@ -39,7 +39,7 @@ pub fn overlap(a: &str, b: &str) -> f64 {
     inter / (ta.len().min(tb.len()) as f64)
 }
 
-fn choice(choice: &str, p: f64, options: &BTreeMap<String, Option<String>>) -> Answer {
+fn choice(choice: &str, p: f64, options: &BTreeMap<String, Value>) -> Answer {
     let n = options.len().max(1);
     let rest = if n > 1 { (1.0 - p) / (n as f64 - 1.0) } else { 0.0 };
     let probabilities = options.keys().map(|k| (k.clone(), if k == choice { p } else { rest })).collect();
@@ -106,11 +106,14 @@ fn answer(id: &str, q: &Question, state: &Value) -> Answer {
                 "tool" => {
                     let intent = s(state, "intent");
                     let mut best = (String::new(), -1.0);
+                    let intent_terms = terms(intent);
                     for (k, d) in criteria {
-                        let text = format!("{} {}", k.replace('_', " "), d.clone().unwrap_or_default());
+                        let text = format!("{} {}", k.replace('_', " "), super::questions::criteria_text(d));
                         let mut sc = overlap(intent, &text);
                         if intent.to_ascii_lowercase().contains(&k.replace('_', " ")) || intent.to_ascii_lowercase().contains(k.as_str()) {
                             sc += 0.5;
+                        } else if k.split('_').all(|w| intent_terms.contains(w)) {
+                            sc += 0.4;
                         }
                         if sc > best.1 {
                             best = (k.clone(), sc);
@@ -118,19 +121,6 @@ fn answer(id: &str, q: &Question, state: &Value) -> Answer {
                     }
                     let p = (0.35 + best.1).min(0.95);
                     choice(&best.0, p, criteria)
-                }
-                "permit" => {
-                    let cmd = s(state, "command");
-                    let access = s(state, "access");
-                    let lower = cmd.to_ascii_lowercase();
-                    let dangerous = ["rm -rf", "sudo", "curl", "wget", "ssh ", "scp ", "> /dev", "mkfs", "dd if=", ":(){"];
-                    if dangerous.iter().any(|d| lower.contains(d)) {
-                        choice("deny", 0.85, criteria)
-                    } else if access == "read" {
-                        choice("allow", 0.9, criteria)
-                    } else {
-                        choice("ask", 0.6, criteria)
-                    }
                 }
                 _ => {
                     let first = criteria.keys().next().cloned().unwrap_or_default();
@@ -177,6 +167,19 @@ fn answer(id: &str, q: &Question, state: &Value) -> Answer {
                     }
                 }
                 "dup" => overlap(s(state, "new"), s(state, "existing")).clamp(0.02, 0.98),
+                _ if id.starts_with(super::questions::PERMIT_PREFIX) => {
+                    let cmd = s(state, "command").to_ascii_lowercase();
+                    let access = s(state, "access");
+                    let has = |pats: &[&str]| pats.iter().any(|p| cmd.contains(p));
+                    match &id[super::questions::PERMIT_PREFIX.len()..] {
+                        "destructive" => if has(&["rm -rf", "rm -fr", "reset --hard", "push --force", "push -f", "clean -f", "mkfs", "dd if=", "drop table", "> /dev/"]) && !cmd.contains("rm -rf target") { 0.92 } else { 0.05 },
+                        "exfiltrates" => if has(&["curl", "wget", "ssh ", "scp ", "git push", "publish", "upload", "http://", "https://", "mail"]) { 0.85 } else { 0.05 },
+                        "credentials" => if has(&[".env", ".ssh", "id_rsa", "secret", "token", "password", "credential", "aws configure"]) { 0.9 } else { 0.05 },
+                        "serves_goal" => (0.5 + 0.45 * overlap(&format!("{} {}", s(state, "goal"), s(state, "intent")), &cmd)).min(0.95),
+                        "reversible" => if access == "read" { 0.95 } else if has(&["migrate", "deploy", "send", "rm "]) { 0.3 } else { 0.8 },
+                        _ => 0.5,
+                    }
+                }
                 _ if id.starts_with("cond:") => {
                     let text = format!("{} {}", query, s(state, "paths"));
                     (0.15 + overlap(&q.instructions_text(), &text)).clamp(0.05, 0.95)

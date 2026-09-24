@@ -1534,6 +1534,7 @@ dependencies = [
  "ignore",
  "im",
  "jsonschema",
+ "libc",
  "moka",
  "ratatui",
  "redb",

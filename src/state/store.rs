@@ -119,6 +119,13 @@ impl Snapshot {
     pub fn summary(&self, of: &ChunkId, level: Visibility) -> Option<&Chunk> {
         self.by_seq.values().rev().find(|c| matches!(&c.kind, Kind::Summary { of: o, level: l } if o == of && *l == level))
     }
+    /// The first `n` chunks in append order: the store as it was earlier.
+    pub fn prefix(&self, n: usize) -> Snapshot {
+        let by_seq: im::OrdMap<u64, Chunk> = self.by_seq.iter().take(n).map(|(k, v)| (*k, v.clone())).collect();
+        let by_id = by_seq.iter().map(|(k, v)| (v.id, *k)).collect();
+        Snapshot { by_seq, by_id }
+    }
+
     /// Chunks of one session, in order.
     pub fn session<'a>(&'a self, session: &'a str) -> impl Iterator<Item = &'a Chunk> + 'a {
         self.by_seq.values().filter(move |c| c.session == session)

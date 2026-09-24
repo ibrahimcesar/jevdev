@@ -123,10 +123,18 @@ impl Assembler {
     /// older ones (any session) compete on keyword overlap with the query.
     fn candidates<'s>(&self, snap: &'s Snapshot, query: &str, session: &str, turn: u32) -> Vec<(usize, &'s Chunk)> {
         let recent_from = turn.saturating_sub(self.cfg.recent_turns);
+        // Identical bodies across sessions (the same goal run twice) count once: the newest copy wins.
+        let mut newest: HashMap<[u8; 32], usize> = HashMap::new();
+        for (seq, c) in snap.iter().enumerate() {
+            newest.insert(*blake3::hash(c.body.as_bytes()).as_bytes(), seq);
+        }
         let mut recent = Vec::new();
         let mut older = Vec::new();
         for (seq, c) in snap.iter().enumerate() {
             if matches!(c.kind, Kind::Summary { .. } | Kind::Instruction { .. }) {
+                continue;
+            }
+            if newest.get(blake3::hash(c.body.as_bytes()).as_bytes()) != Some(&seq) {
                 continue;
             }
             if c.session == session && c.turn >= recent_from {
@@ -203,7 +211,7 @@ impl Assembler {
                 })
                 .collect();
             let state = json!({ "goal": input.goal, "query": input.query, "turn": input.turn, "chunks": chunks });
-            let qs = batch.iter().map(|c| questions::visibility(&c.id)).collect();
+            let qs = batch.iter().enumerate().map(|(i, c)| questions::visibility(&c.id, i)).collect();
             async move { jev.ask(state, qs).await }
         });
         let responses = futures::future::try_join_all(futs).await?;
@@ -271,7 +279,8 @@ impl Assembler {
             }
             let text = self.render(snap, c, vis, &mut new_chunks).await?;
             let t = tokens::count(&text);
-            items.push(ContextItem { id: c.id, label: c.label(), kind: c.kind.tag(), text, tokens: t, visibility: vis, p, pinned: false, turn: c.turn, seq: base + seq });
+            let label = if c.session == input.session { c.label() } else { format!("{} · session {}", c.label(), c.session) };
+            items.push(ContextItem { id: c.id, label, kind: c.kind.tag(), text, tokens: t, visibility: vis, p, pinned: false, turn: c.turn, seq: base + seq });
         }
 
         // Pack: pinned first, then by probability per token, newest first on ties.

@@ -43,6 +43,21 @@ enum Command {
         /// Answer every permission prompt with no (unattended).
         #[arg(long)]
         no: bool,
+        /// Emit events as JSON lines instead of plain text.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Re-run context assembly over a recorded session, turn by turn, without calling a model.
+    Replay {
+        /// Session id (default: the most recent).
+        #[arg(long)]
+        session: Option<String>,
+        /// Use this query at every turn instead of the recorded one.
+        #[arg(long)]
+        query: Option<String>,
+        /// Print the ladder rows for every turn.
+        #[arg(long)]
+        rows: bool,
     },
     /// Assemble the context for a query and show the visibility ladder, without calling a model.
     Context { query: String },
@@ -85,6 +100,11 @@ enum Command {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Let `jevdev run --json | head` end quietly instead of panicking on EPIPE.
+    #[cfg(unix)]
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
     tracing_subscriber::fmt().with_env_filter(tracing_subscriber::EnvFilter::from_default_env()).with_writer(std::io::stderr).init();
     let cli = Cli::parse();
     let root = runtime::ensure_root(&cli.root.unwrap_or(std::env::current_dir()?))?;
@@ -92,7 +112,8 @@ async fn main() -> Result<()> {
     match cli.command.unwrap_or(Command::Tui { goal: None }) {
         Command::Init { force } => init(&root, force),
         Command::Tui { goal } => jevdev::tui::run(cfg, &root, goal).await,
-        Command::Run { goal, yes, no } => run(cfg, &root, &goal, yes, no).await,
+        Command::Run { goal, yes, no, json } => run(cfg, &root, &goal, yes, no, json).await,
+        Command::Replay { session, query, rows } => replay(cfg, &root, session, query, rows).await,
         Command::Context { query } => context(cfg, &root, &query).await,
         Command::Tools { id, docs } => tools(id, docs),
         Command::Policy { command } => policy(cfg, &root, &command).await,
@@ -274,11 +295,15 @@ fn init(root: &std::path::Path, force: bool) -> Result<()> {
     Ok(())
 }
 
-async fn run(cfg: Config, root: &std::path::Path, goal: &str, yes: bool, no: bool) -> Result<()> {
+async fn run(cfg: Config, root: &std::path::Path, goal: &str, yes: bool, no: bool, json: bool) -> Result<()> {
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Event>();
     let printer = tokio::spawn(async move {
         while let Some(e) = rx.recv().await {
-            print_plain(&e);
+            if json {
+                println!("{}", e.to_json());
+            } else {
+                print_plain(&e);
+            }
         }
     });
     let permissioner: Arc<dyn Permissioner> = if yes {
@@ -292,6 +317,52 @@ async fn run(cfg: Config, root: &std::path::Path, goal: &str, yes: bool, no: boo
     let _ = session.run_goal(goal).await?;
     drop(session);
     let _ = printer.await;
+    Ok(())
+}
+
+async fn replay(cfg: Config, root: &std::path::Path, session: Option<String>, query: Option<String>, rows: bool) -> Result<()> {
+    use jevdev::state::Kind;
+    let (mut s, mut rx) = runtime::open_quiet(cfg, root).await?;
+    let snap = s.snapshot().await;
+    let all: Vec<&Chunk> = snap.iter().collect();
+    let sid = match session {
+        Some(id) => id,
+        None => all.iter().rev().find(|c| matches!(c.kind, Kind::UserTurn)).map(|c| c.session.clone()).ok_or_else(|| anyhow::anyhow!("no recorded sessions; run a goal first"))?,
+    };
+    let goal = all.iter().find(|c| c.session == sid && matches!(c.kind, Kind::UserTurn)).map(|c| c.body.clone()).ok_or_else(|| anyhow::anyhow!("session {sid} has no user turn"))?;
+    let max_turn = all.iter().filter(|c| c.session == sid).map(|c| c.turn).max().unwrap_or(0);
+    println!("replaying session {sid} · {max_turn} turns · goal: {}\n", jevdev::state::truncate(&goal, 100));
+    s.id = sid.clone();
+    s.set_goal(&goal);
+    let mut last_intent: Option<String> = None;
+    for t in 1..=max_turn {
+        // The store as it was when turn t was assembled: everything before the first chunk turn t produced.
+        let cutoff = all.iter().position(|c| c.session == sid && c.turn == t && !matches!(c.kind, Kind::UserTurn | Kind::Summary { .. } | Kind::Instruction { .. })).unwrap_or(all.len());
+        let prefix = snap.prefix(cutoff);
+        let paths: Vec<std::path::PathBuf> = prefix.iter().filter(|c| c.session == sid).flat_map(|c| c.paths.clone()).collect();
+        s.note_paths(paths);
+        s.turn = t;
+        let q = match (&query, &last_intent) {
+            (Some(q), _) => q.clone(),
+            (None, Some(i)) => format!("{goal}\n\n(last action: {})", jevdev::state::truncate(i, 200)),
+            (None, None) => goal.clone(),
+        };
+        let ctx = s.assemble_snapshot(&prefix, &q).await?;
+        let cache = ctx.cache.as_ref().map(|c| format!(" · cache {} p={:.2}", if c.reuse { "reuse" } else { "rebuild" }, c.p)).unwrap_or_default();
+        println!("turn {t:<3} {:>6} / {} tok · jev {:<3} memo {:<3} hidden {:<3} dropped {:<3}{cache}", ctx.tokens, ctx.budget, ctx.scored, ctx.memo_hits, ctx.hidden, ctx.dropped);
+        if rows {
+            for i in &ctx.items {
+                println!("         {:<5} {:>6} tok  p={:.2}  {}{}", i.visibility, i.tokens, i.p, if i.pinned { "📌 " } else { "" }, i.label);
+            }
+        }
+        last_intent = all.iter().find(|c| c.session == sid && c.turn == t).and_then(|_| all.iter().find(|c| c.session == sid && c.turn == t && matches!(c.kind, Kind::ToolCall { .. }))).and_then(|c| match &c.kind {
+            Kind::ToolCall { intent, .. } => Some(intent.clone()),
+            _ => None,
+        });
+        while rx.try_recv().is_ok() {}
+    }
+    let js = s.shared.jev.stats();
+    println!("\njev: {} calls · {} questions · {} input tok · {} request memo hits", js.calls, js.questions, js.input_tokens, js.memo_hits);
     Ok(())
 }
 

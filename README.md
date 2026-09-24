@@ -82,6 +82,10 @@ Enter sends a goal. When the policy says `ask`, the input line becomes the permi
 
 Everything the model has ever seen is a `Chunk`: user turns, model notes, tool calls, tool outputs, files, diffs, instruction fragments, summaries, sub-agent results. Chunks are immutable, addressed by a blake3 hash of their content, and appended to a `redb` log under `.jevdev/state.redb`. A snapshot of the store is an O(1) clone of persistent maps, so read-only tasks hold one without blocking writers. A restart is a new session id over the same log: old chunks stay addressable and come back only when Jev scores them relevant.
 
+### Questions, the TypeSafe way
+
+Every question follows [TypeSafe's guide](https://docs.typesafe.ai/concepts/how-to-build-with-system-one): instructions point at state with backticked paths such as `chunks[3]`, choice and noul criteria are contrastive objects with `what`, `not_for`, and `examples`, and broad judgments are decomposed into atomic nouls that code composes. Permissions, for instance, are five nouls (destructive, exfiltrates, credentials, serves the goal, reversible) combined by thresholds in `permit_from`, never one "should this run?" question. All questions about one state go in one request, so Jev evaluates them in parallel.
+
 ### Context as a decision
 
 Each turn the assembler prefilters candidates deterministically (recent turns always, older chunks by keyword overlap), then asks Jev one batched System One request with a `choice` question per chunk: hide, short, long, or full. Short and long views are summaries generated once and stored as chunks. The result is packed to the token budget, pinned instructions first, then by probability per token.

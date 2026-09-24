@@ -237,22 +237,24 @@ impl Policy {
         let mut d = self.evaluate(call, egress, goal)?;
         d.reasons.extend(extra);
         if d.verdict == Verdict::Ask {
-            let (qid, q) = questions::permit();
             let state = json!({
                 "command": call.footprint.command.clone().unwrap_or_else(|| call.describe()),
+                "intent": call.intent,
                 "access": call.access.to_string(),
                 "root": self.root.display().to_string(),
                 "goal": goal,
                 "touches": d.attrs.get("touches").cloned().unwrap_or(Value::Null),
             });
-            let a = jev.ask_one(state, &qid, q).await?;
-            if let Some((choice, p)) = a.as_choice() {
-                d.reasons.push(format!("jev says {choice} (p={p:.2})"));
-                if choice == "allow" && p >= self.jev_auto_allow {
-                    d.verdict = Verdict::Allow;
-                } else if choice == "deny" && p >= 0.8 {
-                    d.verdict = Verdict::Deny;
-                }
+            let resp = jev.ask(state, questions::permit_questions()).await?;
+            let (verdict, p, sig) = questions::permit_from(&resp.answers);
+            d.reasons.push(format!(
+                "jev says {verdict} (p={p:.2}; destructive {:.2}, exfiltrates {:.2}, credentials {:.2}, serves goal {:.2}, reversible {:.2})",
+                sig.destructive, sig.exfiltrates, sig.credentials, sig.serves_goal, sig.reversible
+            ));
+            if verdict == "allow" && p >= self.jev_auto_allow {
+                d.verdict = Verdict::Allow;
+            } else if verdict == "deny" && p >= 0.8 {
+                d.verdict = Verdict::Deny;
             }
         }
         Ok(d)

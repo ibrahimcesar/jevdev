@@ -46,6 +46,10 @@ pub struct PolicyDecision {
 
 pub struct Policy {
     set: PolicySet,
+    /// Cedar's parser assigns `policy0`, `policy1`, … when reading a policy
+    /// set from text, so each rule's `@id("…")` annotation is looked up here
+    /// to report the name the file gives it.
+    names: std::collections::HashMap<String, String>,
     root: PathBuf,
     read_only: Vec<String>,
     sensitive: Vec<PathBuf>,
@@ -65,6 +69,10 @@ impl Policy {
 
     pub fn from_source(src: &str, root: &Path, cfg: &Config) -> Result<Self> {
         let set = PolicySet::from_str(src).map_err(|e| anyhow!("cedar policy parse error: {e}"))?;
+        let names = set
+            .policies()
+            .filter_map(|p| p.annotation("id").map(|a| (p.id().to_string(), a.to_string())))
+            .collect();
         let home = std::env::var("HOME").unwrap_or_default();
         let sensitive = cfg
             .security
@@ -74,6 +82,7 @@ impl Policy {
             .collect();
         Ok(Self {
             set,
+            names,
             root: root.to_path_buf(),
             read_only: cfg.policy.read_only.clone(),
             sensitive,
@@ -192,7 +201,7 @@ impl Policy {
         let resource = EntityUid::from_str(&format!(r#"Cmd::"{id}""#)).map_err(|e| anyhow!("{e}"))?;
         let req = Request::new(principal, action_uid, resource, context, None).map_err(|e| anyhow!("cedar request: {e}"))?;
         let resp = Authorizer::new().is_authorized(&req, &self.set, &entities);
-        let mut reasons: Vec<String> = resp.diagnostics().reason().map(|p| p.to_string()).collect();
+        let mut reasons: Vec<String> = resp.diagnostics().reason().map(|p| self.names.get(&p.to_string()).cloned().unwrap_or_else(|| p.to_string())).collect();
         for e in resp.diagnostics().errors() {
             reasons.push(format!("cedar error: {e}"));
         }

@@ -100,7 +100,7 @@ impl ChunkStore {
 
 impl Snapshot {
     /// Chunks in append order.
-    pub fn iter(&self) -> impl Iterator<Item = &Chunk> {
+    pub fn iter(&self) -> impl DoubleEndedIterator<Item = &Chunk> + '_ {
         self.by_seq.values()
     }
     pub fn get(&self, id: &ChunkId) -> Option<&Chunk> {
